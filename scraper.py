@@ -190,5 +190,10 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     events = scrape_all_pages(AGENDA_URL)
     cal = build_ics(events)
-    with
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+        f.writelines(cal)
+    print(f"Generado {OUTPUT_PATH} con {len(list(cal.events))} eventos")
 
+
+if __name__ == "__main__":
+    main()
