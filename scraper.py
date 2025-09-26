@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 from dateutil import tz
 import dateparser
 from ics import Calendar, Event
+from ics.grammar.parse import ContentLine  # << añadir
 
 from playwright.sync_api import sync_playwright
 
@@ -17,8 +18,8 @@ OUTPUT_DIR = os.path.join("public")
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, "events.ics")
 CAL_NAME = "Agenda Palau Sant Jordi"
 
-DATE_REGEX = re.compile(r"(\\d{1,2})\\s+de\\s+([A-Za-záéíóúñÁÉÍÓÚÑ]+)\\s+de\\s+(\\d{4})", re.IGNORECASE)
-TIME_REGEX = re.compile(r"(\\d{1,2}):(\\d{2})")
+DATE_REGEX = re.compile(r"(\d{1,2})\s+de\s+([A-Za-záéíóúñÁÉÍÓÚÑ]+)\s+de\s+(\d{4})", re.IGNORECASE)
+TIME_REGEX = re.compile(r"(\d{1,2}):(\d{2})")
 
 MONTHS_ES = {
     "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
@@ -53,7 +54,7 @@ def parse_events_from_page(html: str, base_url: str) -> list[dict]:
 
         href = None
         if title_tag and title_tag.has_attr("href"):
-            href = urljoin(base_url, title_tag["href"]) 
+            href = urljoin(base_url, title_tag["href"])
 
         date_block = None
         for sel in [
@@ -180,7 +181,8 @@ def build_ics(events: list[dict]) -> Calendar:
         e.description = ev.get("description")
         e.uid = make_uid(ev.get("url") or ev.get("title"))
         cal.events.add(e)
-    cal.extra.append(("X-WR-CALNAME", CAL_NAME))
+    # Línea corregida: usar ContentLine en vez de tupla
+    cal.extra.append(ContentLine(name="X-WR-CALNAME", params={}, value=CAL_NAME))
     return cal
 
 
@@ -188,10 +190,5 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     events = scrape_all_pages(AGENDA_URL)
     cal = build_ics(events)
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-        f.writelines(cal)
-    print(f"Generado {OUTPUT_PATH} con {len(list(cal.events))} eventos")
+    with
 
-
-if __name__ == "__main__":
-    main()
