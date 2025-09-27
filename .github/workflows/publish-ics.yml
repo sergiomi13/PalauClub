@@ -32,6 +32,7 @@ jobs:
 
       - name: Build ICS
         run: |
+          mkdir -p public
           python scraper.py
 
       - name: Upload artifact
