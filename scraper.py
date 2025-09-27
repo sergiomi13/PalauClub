@@ -1,7 +1,7 @@
 import hashlib
 import os
 import re
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from dateutil import tz
@@ -17,187 +17,191 @@ OUTPUT_DIR = os.path.join("public")
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, "events.ics")
 CAL_NAME = "Agenda Palau Sant Jordi"
 
+# Rendimiento
+MAX_PAGES = 4         # nº máx de páginas de agenda a recorrer
+MAX_EVENTS = 120      # tope de eventos por ejecución
+
+# Regex útiles
 DATE_REGEX = re.compile(r"(\d{1,2})\s+de\s+([A-Za-záéíóúñÁÉÍÓÚÑ]+)\s+de\s+(\d{4})", re.IGNORECASE)
 TIME_REGEX = re.compile(r"(\d{1,2}):(\d{2})")
-
 MONTHS_ES = {
-    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
-    "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9, "octubre": 10,
-    "noviembre": 11, "diciembre": 12
+    "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
+    "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,
+    "noviembre":11,"diciembre":12
 }
 
-
-def get_html(url: str) -> str:
-    """Carga HTML renderizado con Playwright (por si hay JS)."""
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=(
+class Browser:
+    """Navegador Playwright reutilizable y ligero (bloquea recursos pesados)."""
+    def __enter__(self):
+        self._p = sync_playwright().start()
+        self.browser = self._p.chromium.launch(headless=True)
+        self.context = self.browser.new_context(user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
         ))
-        page = context.new_page()
-        page.goto(url, wait_until="networkidle", timeout=60_000)
-        html = page.content()
-        browser.close()
-    return html
+        def _route(route):
+            if route.request.resource_type in ("image", "stylesheet", "font", "media"):
+                return route.abort()
+            return route.continue_()
+        self.context.route("**/*", _route)
+        self.page = self.context.new_page()
+        self.page.set_default_navigation_timeout(30_000)
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.context.close(); self.browser.close(); self._p.stop()
+        except Exception:
+            pass
+    def get_html(self, url: str) -> str:
+        self.page.goto(url, wait_until="domcontentloaded")
+        return self.page.content()
 
+def absolutize(base_url: str, href: str | None) -> str | None:
+    if not href: return None
+    return urljoin(base_url, href)
 
-def get_title_from_detail(url: str) -> str | None:
-    """Abre la ficha del evento y toma el <h1> (o variantes)."""
-    try:
-        html = get_html(url)
-    except Exception:
-        return None
-    soup = BeautifulSoup(html, "lxml")
-    h1 = soup.select_one("h1, .page-title h1, .node__title h1, .title h1")
-    if h1 and h1.get_text(strip=True):
-        return h1.get_text(strip=True)
-    # Fallback: <title> de la página
-    tt = soup.select_one("title")
-    if tt and tt.get_text(strip=True):
-        return tt.get_text(strip=True).strip()
-    return None
-
-
-def parse_events_from_page(html: str, base_url: str) -> list[dict]:
-    """Extrae eventos de una página HTML de la agenda."""
-    soup = BeautifulSoup(html, "lxml")
-
-    # Tarjetas de evento (varios posibles contenedores)
-    cards = soup.select("article, .views-row, .event, .node--type-event, .card, .node, .teaser")
-
-    events = []
-    for card in cards:
-        # Título (intento rápido desde la tarjeta)
-        title_tag = card.select_one(
-            "h2 a, h3 a, .event-title, .node__title a, .views-field-title a, h2, h3, .node__title"
-        )
-        title = title_tag.get_text(strip=True) if title_tag else None
-
-        # URL del evento (para poder entrar a la ficha si hace falta)
-        href = None
-        if title_tag and title_tag.has_attr("href"):
-            href = urljoin(base_url, title_tag["href"])
-        if not href:
-            any_link = card.select_one("a[href^='/'], a[href*='palausantjordi.barcelona']")
-            if any_link and any_link.has_attr("href"):
-                href = urljoin(base_url, any_link["href"])
-
-        # Si el título no está claro en la tarjeta, lo sacamos de la ficha
-        if (not title or title.strip().lower() in {"", "sin título", "evento sin título"}) and href:
-            detail_title = get_title_from_detail(href)
-            if detail_title:
-                title = detail_title
-
-        # Bloque de fecha/hora
-        date_block_text = None
-        for sel in [".date", ".field--name-field-date", ".event-date", ".node__meta", ".info", ".meta", "time"]:
-            node = card.select_one(sel)
-            if node and node.get_text(strip=True):
-                date_block_text = node.get_text(" ", strip=True)
-                break
-        if not date_block_text:
-            date_block_text = card.get_text(" ", strip=True)
-
-        # Localización
-        loc_tag = card.select_one(".location, .field--name-field-venue, .event-venue")
-        location = loc_tag.get_text(" ", strip=True) if loc_tag else "Palau Sant Jordi, Barcelona"
-
-        # Descripción
-        desc_tag = card.select_one(".teaser, .summary, .field--name-body, p")
-        description = desc_tag.get_text(" ", strip=True)[:500] if desc_tag else ""
-
-        # Parsear fecha/hora
-        start_dt = extract_datetime_es(date_block_text)
-        if not start_dt:
-            continue
-
-        events.append({
-            "title": title or "Sin título",
-            "url": href or base_url,
-            "start_dt": start_dt,
-            "location": location,
-            "description": description,
-        })
-
-    return dedupe_events(events)
-
+def looks_like_event_link(href: str) -> bool:
+    """Filtro laxo: enlaces a páginas de evento (evita paginación y la propia /agenda)."""
+    if not href: return False
+    if "?" in href and "page=" in href: return False
+    if href.rstrip("/").endswith("/agenda"): return False
+    # evita anchors y externos raros
+    p = urlparse(href)
+    if p.scheme and "palausantjordi" not in p.netloc:
+        return False
+    # algo de profundidad en la ruta
+    return href.count("/") >= 4
 
 def extract_datetime_es(text: str):
     if not text:
         return None
+    # 1) dateparser primero (soporta castellano)
     dt = dateparser.parse(
-        text,
-        languages=["es"],
+        text, languages=["es"],
         settings={
             "TIMEZONE": "Europe/Madrid",
             "RETURN_AS_TIMEZONE_AWARE": True,
-            "PREFER_DATES_FROM": "future"
+            "PREFER_DATES_FROM": "future",
         },
     )
-    if dt:
-        return dt
+    if dt: return dt
+    # 2) fallback a regex de fecha + hora simple
     m = DATE_REGEX.search(text)
-    if not m:
-        return None
+    if not m: return None
     day = int(m.group(1))
     month_name = m.group(2).lower()
     year = int(m.group(3))
     month = MONTHS_ES.get(month_name)
-    if not month:
-        return None
+    if not month: return None
     tm = TIME_REGEX.search(text)
     hour, minute = (DEFAULT_TIME if not tm else (int(tm.group(1)), int(tm.group(2))))
     import datetime as _dt
     dt_naive = _dt.datetime(year, month, day, hour, minute)
     return dt_naive.replace(tzinfo=DEFAULT_TZ)
 
-
-def dedupe_events(events: list[dict]) -> list[dict]:
-    seen = set()
-    unique = []
-    for ev in events:
-        key = (ev.get("url"), ev.get("title"), ev.get("start_dt"))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(ev)
-    return unique
-
-
-def make_uid(url: str) -> str:
-    return hashlib.sha1(url.encode("utf-8")).hexdigest() + "@palausantjordi"
-
-
-def scrape_all_pages(start_url: str) -> list[dict]:
-    html = get_html(start_url)
-    events = parse_events_from_page(html, start_url)
-
-    # Paginación básica (?page=, rel=next)
+def parse_listing_get_links(html: str, base_url: str) -> list[str]:
+    """Desde la página de agenda, recojo todos los posibles enlaces a fichas de evento."""
     soup = BeautifulSoup(html, "lxml")
-    page_links = set()
-    for a in soup.select("a[href*='?page='], a[rel='next']"):
-        href = urljoin(start_url, a.get("href"))
-        page_links.add(href)
+    links = []
+    # 1) enlaces dentro de tarjetas/neuronas habituales
+    cards = soup.select("article, .views-row, .event, .node--type-event, .card, .node, .teaser")
+    for card in cards:
+        for a in card.select("a"):
+            href = absolutize(base_url, a.get("href"))
+            if href and looks_like_event_link(href):
+                links.append(href)
+    # 2) por si acaso, cualquier <a> de la página que parezca evento
+    for a in soup.select("a"):
+        href = absolutize(base_url, a.get("href"))
+        if href and looks_like_event_link(href):
+            links.append(href)
+    # dedupe conservando orden
+    seen, result = set(), []
+    for h in links:
+        if h not in seen:
+            seen.add(h); result.append(h)
+    return result
 
-    visited = set([start_url])
-    queue = [u for u in sorted(page_links) if u not in visited]
-    while queue and len(visited) < 10:
-        url = queue.pop(0)
-        if url in visited:
-            continue
-        visited.add(url)
-        html_i = get_html(url)
-        events.extend(parse_events_from_page(html_i, url))
+def parse_event_detail(html: str, url: str) -> dict | None:
+    """Desde la FICHA: título (H1), fecha/hora y lugar."""
+    soup = BeautifulSoup(html, "lxml")
+    # Título
+    title = None
+    for sel in ["h1", ".page-title h1", ".node__title h1", ".title h1"]:
+        h = soup.select_one(sel)
+        if h and h.get_text(strip=True):
+            title = h.get_text(strip=True); break
+    if not title:
+        tt = soup.select_one("title")
+        if tt and tt.get_text(strip=True):
+            title = tt.get_text(strip=True).strip()
+    # Fecha/hora: busca nodos típicos y, si no, todo el texto
+    date_text = None
+    for sel in [".date", ".field--name-field-date", ".event-date", ".node__meta", ".info", ".meta", "time"]:
+        n = soup.select_one(sel)
+        if n and n.get_text(strip=True):
+            date_text = n.get_text(" ", strip=True); break
+    if not date_text:
+        # mira texto entero pero limita longitud
+        date_text = soup.get_text(" ", strip=True)[:3000]
+    dt = extract_datetime_es(date_text)
+    if not dt:
+        return None
+    # Lugar (si no aparece, por defecto)
+    venue = "Palau Sant Jordi, Barcelona"
+    for sel in [".location", ".field--name-field-venue", ".event-venue", "[itemprop='location']"]:
+        n = soup.select_one(sel)
+        if n and n.get_text(strip=True):
+            venue = n.get_text(" ", strip=True); break
+    # Descripción corta
+    desc = ""
+    d = soup.select_one(".teaser, .summary, .field--name-body, article p, .content p")
+    if d:
+        desc = d.get_text(" ", strip=True)[:500]
+    return {
+        "title": title or "Evento",
+        "url": url,
+        "start_dt": dt,
+        "location": venue,
+        "description": desc,
+    }
 
-        soup_i = BeautifulSoup(html_i, "lxml")
-        for a in soup_i.select("a[href*='?page='], a[rel='next']"):
-            href = urljoin(start_url, a.get("href"))
-            if href not in visited and href not in queue and len(visited) + len(queue) < 10:
-                queue.append(href)
-
-    return dedupe_events(events)
-
+def scrape_all_events() -> list[dict]:
+    events = []
+    with Browser() as session:
+        # 1) página principal + paginación
+        first_html = session.get_html(AGENDA_URL)
+        all_pages = [AGENDA_URL]
+        # detectar paginación (?page= / rel=next)
+        soup = BeautifulSoup(first_html, "lxml")
+        page_links = set()
+        for a in soup.select("a[href*='?page='], a[rel='next']"):
+            page_links.add(absolutize(AGENDA_URL, a.get("href")))
+        for h in sorted(page_links):
+            if len(all_pages) >= MAX_PAGES: break
+            all_pages.append(h)
+        # 2) extraer enlaces y entrar a cada ficha
+        for page_url in all_pages:
+            html = first_html if page_url == AGENDA_URL else session.get_html(page_url)
+            links = parse_listing_get_links(html, page_url)
+            for link in links:
+                if len(events) >= MAX_EVENTS: break
+                try:
+                    detail_html = session.get_html(link)
+                    ev = parse_event_detail(detail_html, link)
+                    if ev:
+                        events.append(ev)
+                except Exception:
+                    # si falla una ficha, seguimos con la siguiente
+                    continue
+            if len(events) >= MAX_EVENTS: break
+    # dedupe por url+fecha
+    seen, uniq = set(), []
+    for ev in events:
+        key = (ev["url"], ev["start_dt"])
+        if key in seen: continue
+        seen.add(key); uniq.append(ev)
+    return uniq
 
 def build_ics(events: list[dict]) -> Calendar:
     cal = Calendar()
@@ -209,28 +213,22 @@ def build_ics(events: list[dict]) -> Calendar:
         e.location = ev.get("location")
         e.url = ev.get("url")
         e.description = ev.get("description")
-        e.uid = make_uid(ev.get("url") or ev.get("title"))
+        e.uid = hashlib.sha1((ev.get("url") or ev["title"]).encode("utf-8")).hexdigest() + "@palausantjordi"
         cal.events.add(e)
     cal.extra.append(ContentLine(name="X-WR-CALNAME", params={}, value=CAL_NAME))
     return cal
 
-
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    events = scrape_all_pages(AGENDA_URL)
+    events = scrape_all_events()
     cal = build_ics(events)
-
     print(f"Se han detectado {len(list(cal.events))} eventos")
-
     if not cal.events:
         print("⚠️ No se encontraron eventos, no se generará el .ics")
         return
-
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         f.writelines(cal)
-
     print(f"✅ Generado {OUTPUT_PATH} con {len(list(cal.events))} eventos")
-
 
 if __name__ == "__main__":
     main()
