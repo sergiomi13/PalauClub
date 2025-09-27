@@ -28,6 +28,7 @@ MONTHS_ES = {
 
 
 def get_html(url: str) -> str:
+    """Carga HTML renderizado con Playwright (por si hay JS)."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(user_agent=(
@@ -41,24 +42,39 @@ def get_html(url: str) -> str:
     return html
 
 
+def get_title_from_detail(url: str) -> str | None:
+    """Abre la ficha del evento y toma el <h1> (o variantes)."""
+    try:
+        html = get_html(url)
+    except Exception:
+        return None
+    soup = BeautifulSoup(html, "lxml")
+    h1 = soup.select_one("h1, .page-title h1, .node__title h1, .title h1")
+    if h1 and h1.get_text(strip=True):
+        return h1.get_text(strip=True)
+    # Fallback: <title> de la página
+    tt = soup.select_one("title")
+    if tt and tt.get_text(strip=True):
+        return tt.get_text(strip=True).strip()
+    return None
+
+
 def parse_events_from_page(html: str, base_url: str) -> list[dict]:
     """Extrae eventos de una página HTML de la agenda."""
     soup = BeautifulSoup(html, "lxml")
 
-    # Tarjetas de evento (ajustamos varios posibles selectores)
-    cards = soup.select(
-        "article, .views-row, .event, .node--type-event, .card, .node, .teaser"
-    )
+    # Tarjetas de evento (varios posibles contenedores)
+    cards = soup.select("article, .views-row, .event, .node--type-event, .card, .node, .teaser")
 
     events = []
     for card in cards:
-        # Título
+        # Título (intento rápido desde la tarjeta)
         title_tag = card.select_one(
             "h2 a, h3 a, .event-title, .node__title a, .views-field-title a, h2, h3, .node__title"
         )
-        title = title_tag.get_text(strip=True) if title_tag else "Sin título"
+        title = title_tag.get_text(strip=True) if title_tag else None
 
-        # URL del evento
+        # URL del evento (para poder entrar a la ficha si hace falta)
         href = None
         if title_tag and title_tag.has_attr("href"):
             href = urljoin(base_url, title_tag["href"])
@@ -67,17 +83,15 @@ def parse_events_from_page(html: str, base_url: str) -> list[dict]:
             if any_link and any_link.has_attr("href"):
                 href = urljoin(base_url, any_link["href"])
 
-        # Fecha/hora
+        # Si el título no está claro en la tarjeta, lo sacamos de la ficha
+        if (not title or title.strip().lower() in {"", "sin título", "evento sin título"}) and href:
+            detail_title = get_title_from_detail(href)
+            if detail_title:
+                title = detail_title
+
+        # Bloque de fecha/hora
         date_block_text = None
-        for sel in [
-            ".date",
-            ".field--name-field-date",
-            ".event-date",
-            ".node__meta",
-            ".info",
-            ".meta",
-            "time",
-        ]:
+        for sel in [".date", ".field--name-field-date", ".event-date", ".node__meta", ".info", ".meta", "time"]:
             node = card.select_one(sel)
             if node and node.get_text(strip=True):
                 date_block_text = node.get_text(" ", strip=True)
@@ -98,15 +112,13 @@ def parse_events_from_page(html: str, base_url: str) -> list[dict]:
         if not start_dt:
             continue
 
-        events.append(
-            {
-                "title": title,
-                "url": href or base_url,
-                "start_dt": start_dt,
-                "location": location,
-                "description": description,
-            }
-        )
+        events.append({
+            "title": title or "Sin título",
+            "url": href or base_url,
+            "start_dt": start_dt,
+            "location": location,
+            "description": description,
+        })
 
     return dedupe_events(events)
 
@@ -161,6 +173,7 @@ def scrape_all_pages(start_url: str) -> list[dict]:
     html = get_html(start_url)
     events = parse_events_from_page(html, start_url)
 
+    # Paginación básica (?page=, rel=next)
     soup = BeautifulSoup(html, "lxml")
     page_links = set()
     for a in soup.select("a[href*='?page='], a[rel='next']"):
