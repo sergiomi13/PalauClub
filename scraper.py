@@ -47,11 +47,10 @@ def parse_events_from_page(html: str, base_url: str) -> list[dict]:
     cards = soup.select("article, .views-row, .event, .node--type-event, .card")
     events = []
     for card in cards:
-        title_tag = card.select_one("h2 a, h3 a, a[href*='/es/'], a[href*='/en/'], a[href*='/ca/']")
-        if not title_tag or not title_tag.get_text(strip=True):
-            title_tag = card.select_one("h2, h3")
-        title = title_tag.get_text(strip=True) if title_tag else None
-
+        title_tag = card.select_one("h2 a, h3 a, .event-title, .node__title a, .views-field-title a")
+if not title_tag or not title_tag.get_text(strip=True):
+    title_tag = card.select_one("h2, h3, .event-title, .node__title")
+title = title_tag.get_text(strip=True) if title_tag else "Sin título"
         href = None
         if title_tag and title_tag.has_attr("href"):
             href = urljoin(base_url, title_tag["href"])
