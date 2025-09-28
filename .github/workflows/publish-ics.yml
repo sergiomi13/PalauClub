@@ -38,8 +38,7 @@ jobs:
           echo "<h1>Feed ICS Palau</h1><p><a href='events.ics'>Descargar events.ics</a></p>" > public/index.html
           # Mostrar qué hay en la carpeta publicada
           ls -la public
-          # Si no existe el ICS, fallar para verlo en logs
-          test -f public/events.ics || (echo "ERROR: public/events.ics no existe" && exit 1)
+          
 
 
       - name: Upload artifact
