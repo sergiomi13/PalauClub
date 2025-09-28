@@ -18,10 +18,9 @@ OUTPUT_PATH = os.path.join(OUTPUT_DIR, "events.ics")
 CAL_NAME = "Agenda Palau Sant Jordi"
 
 # Rendimiento
-MAX_PAGES = 4         # nº máx de páginas de agenda a recorrer
-MAX_EVENTS = 120      # tope de eventos por ejecución
+MAX_PAGES = 4
+MAX_EVENTS = 120
 
-# Regex útiles
 DATE_REGEX = re.compile(r"(\d{1,2})\s+de\s+([A-Za-záéíóúñÁÉÍÓÚÑ]+)\s+de\s+(\d{4})", re.IGNORECASE)
 TIME_REGEX = re.compile(r"(\d{1,2}):(\d{2})")
 MONTHS_ES = {
@@ -31,7 +30,7 @@ MONTHS_ES = {
 }
 
 class Browser:
-    """Navegador Playwright reutilizable y ligero (bloquea recursos pesados)."""
+    """Reutiliza un navegador Playwright y bloquea recursos pesados."""
     def __enter__(self):
         self._p = sync_playwright().start()
         self.browser = self._p.chromium.launch(headless=True)
@@ -56,26 +55,9 @@ class Browser:
         self.page.goto(url, wait_until="domcontentloaded")
         return self.page.content()
 
-def absolutize(base_url: str, href: str | None) -> str | None:
-    if not href: return None
-    return urljoin(base_url, href)
-
-def looks_like_event_link(href: str) -> bool:
-    """Filtro laxo: enlaces a páginas de evento (evita paginación y la propia /agenda)."""
-    if not href: return False
-    if "?" in href and "page=" in href: return False
-    if href.rstrip("/").endswith("/agenda"): return False
-    # evita anchors y externos raros
-    p = urlparse(href)
-    if p.scheme and "palausantjordi" not in p.netloc:
-        return False
-    # algo de profundidad en la ruta
-    return href.count("/") >= 4
-
 def extract_datetime_es(text: str):
     if not text:
         return None
-    # 1) dateparser primero (soporta castellano)
     dt = dateparser.parse(
         text, languages=["es"],
         settings={
@@ -84,50 +66,65 @@ def extract_datetime_es(text: str):
             "PREFER_DATES_FROM": "future",
         },
     )
-    if dt: return dt
-    # 2) fallback a regex de fecha + hora simple
+    if dt:
+        return dt
     m = DATE_REGEX.search(text)
-    if not m: return None
+    if not m:
+        return None
     day = int(m.group(1))
     month_name = m.group(2).lower()
     year = int(m.group(3))
     month = MONTHS_ES.get(month_name)
-    if not month: return None
+    if not month:
+        return None
     tm = TIME_REGEX.search(text)
     hour, minute = (DEFAULT_TIME if not tm else (int(tm.group(1)), int(tm.group(2))))
     import datetime as _dt
     dt_naive = _dt.datetime(year, month, day, hour, minute)
-    return dt_naive.replace(tzinfo=DEFAULT_TZ)
+    return dt_naive.replace(tzinfo=tz.gettz("Europe/Madrid"))
 
 def parse_listing_get_links(html: str, base_url: str) -> list[str]:
-    """Desde la página de agenda, recojo todos los posibles enlaces a fichas de evento."""
+    """
+    Coge enlaces potenciales a fichas desde la página de agenda.
+    Estrategia laxa: cualquier <a> interno que NO sea paginación ni la propia /agenda.
+    """
     soup = BeautifulSoup(html, "lxml")
     links = []
-    # 1) enlaces dentro de tarjetas/neuronas habituales
-    cards = soup.select("article, .views-row, .event, .node--type-event, .card, .node, .teaser")
-    for card in cards:
-        for a in card.select("a"):
-            href = absolutize(base_url, a.get("href"))
-            if href and looks_like_event_link(href):
-                links.append(href)
-    # 2) por si acaso, cualquier <a> de la página que parezca evento
-    for a in soup.select("a"):
-        href = absolutize(base_url, a.get("href"))
-        if href and looks_like_event_link(href):
-            links.append(href)
+    for a in soup.select("a[href]"):
+        href = a.get("href")
+        if not href:
+            continue
+        href_abs = urljoin(base_url, href)
+        p = urlparse(href_abs)
+        # Debe ser del mismo dominio
+        if "palausantjordi.barcelona" not in (p.netloc or ""):
+            continue
+        # fuera paginación/listado
+        if "page=" in (p.query or ""):
+            continue
+        if p.path.rstrip("/") == "/es/agenda":
+            continue
+        # descartamos anchors
+        if p.fragment:
+            continue
+        # un poco de profundidad en la ruta
+        if p.path.count("/") < 3:
+            continue
+        links.append(href_abs)
+
     # dedupe conservando orden
-    seen, result = set(), []
+    seen, out = set(), []
     for h in links:
         if h not in seen:
-            seen.add(h); result.append(h)
-    return result
+            seen.add(h); out.append(h)
+    return out
 
 def parse_event_detail(html: str, url: str) -> dict | None:
-    """Desde la FICHA: título (H1), fecha/hora y lugar."""
+    """Desde la FICHA: título (H1/Title), fecha/hora y lugar."""
     soup = BeautifulSoup(html, "lxml")
     # Título
     title = None
-    for sel in ["h1", ".page-title h1", ".node__title h1", ".title h1"]:
+    for sel in ["h1", ".page-title h1", ".node__title h1", ".title h1", "header h1"]:
         h = soup.select_one(sel)
         if h and h.get_text(strip=True):
             title = h.get_text(strip=True); break
@@ -135,29 +132,32 @@ def parse_event_detail(html: str, url: str) -> dict | None:
         tt = soup.select_one("title")
         if tt and tt.get_text(strip=True):
             title = tt.get_text(strip=True).strip()
-    # Fecha/hora: busca nodos típicos y, si no, todo el texto
+
+    # Fecha/hora
     date_text = None
     for sel in [".date", ".field--name-field-date", ".event-date", ".node__meta", ".info", ".meta", "time"]:
         n = soup.select_one(sel)
         if n and n.get_text(strip=True):
             date_text = n.get_text(" ", strip=True); break
     if not date_text:
-        # mira texto entero pero limita longitud
         date_text = soup.get_text(" ", strip=True)[:3000]
     dt = extract_datetime_es(date_text)
     if not dt:
         return None
-    # Lugar (si no aparece, por defecto)
+
+    # Lugar
     venue = "Palau Sant Jordi, Barcelona"
     for sel in [".location", ".field--name-field-venue", ".event-venue", "[itemprop='location']"]:
         n = soup.select_one(sel)
         if n and n.get_text(strip=True):
             venue = n.get_text(" ", strip=True); break
+
     # Descripción corta
     desc = ""
     d = soup.select_one(".teaser, .summary, .field--name-body, article p, .content p")
     if d:
         desc = d.get_text(" ", strip=True)[:500]
+
     return {
         "title": title or "Evento",
         "url": url,
@@ -169,37 +169,47 @@ def parse_event_detail(html: str, url: str) -> dict | None:
 def scrape_all_events() -> list[dict]:
     events = []
     with Browser() as session:
-        # 1) página principal + paginación
+        # 1) agenda principal
         first_html = session.get_html(AGENDA_URL)
-        all_pages = [AGENDA_URL]
-        # detectar paginación (?page= / rel=next)
+
+        # 🔎 GUARDAR DEBUG de la agenda para inspección
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        with open(os.path.join(OUTPUT_DIR, "debug.html"), "w", encoding="utf-8") as f:
+            f.write(first_html)
+        print("✅ Guardado public/debug.html con la agenda descargada")
+
+        # 2) paginación simple
         soup = BeautifulSoup(first_html, "lxml")
-        page_links = set()
+        page_urls = [AGENDA_URL]
         for a in soup.select("a[href*='?page='], a[rel='next']"):
-            page_links.add(absolutize(AGENDA_URL, a.get("href")))
-        for h in sorted(page_links):
-            if len(all_pages) >= MAX_PAGES: break
-            all_pages.append(h)
-        # 2) extraer enlaces y entrar a cada ficha
-        for page_url in all_pages:
-            html = first_html if page_url == AGENDA_URL else session.get_html(page_url)
+            page_urls.append(urljoin(AGENDA_URL, a.get("href")))
+        # limitar páginas
+        page_urls = list(dict.fromkeys(page_urls))[:MAX_PAGES]
+
+        # 3) recorrer páginas y fichas
+        for i, page_url in enumerate(page_urls):
+            html = first_html if i == 0 else session.get_html(page_url)
             links = parse_listing_get_links(html, page_url)
+            print(f"Página {i+1}: {len(links)} enlaces candidatos")
             for link in links:
-                if len(events) >= MAX_EVENTS: break
+                if len(events) >= MAX_EVENTS:
+                    break
                 try:
                     detail_html = session.get_html(link)
                     ev = parse_event_detail(detail_html, link)
                     if ev:
                         events.append(ev)
                 except Exception:
-                    # si falla una ficha, seguimos con la siguiente
                     continue
-            if len(events) >= MAX_EVENTS: break
+            if len(events) >= MAX_EVENTS:
+                break
+
     # dedupe por url+fecha
     seen, uniq = set(), []
     for ev in events:
         key = (ev["url"], ev["start_dt"])
-        if key in seen: continue
+        if key in seen:
+            continue
         seen.add(key); uniq.append(ev)
     return uniq
 
@@ -225,6 +235,7 @@ def main():
     print(f"Se han detectado {len(list(cal.events))} eventos")
     if not cal.events:
         print("⚠️ No se encontraron eventos, no se generará el .ics")
+        # Aun así dejamos debug.html publicado
         return
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         f.writelines(cal)
