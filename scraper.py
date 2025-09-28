@@ -52,7 +52,9 @@ class Browser:
         except Exception:
             pass
     def get_html(self, url: str) -> str:
-        self.page.goto(url, wait_until="domcontentloaded")
+        self.page.goto(url, wait_until="networkidle")
+        # esperar explícitamente a que aparezca al menos un evento
+        self.page.wait_for_selector("article, .views-row, .event, .node--type-event", timeout=60000)
         return self.page.content()
 
 def extract_datetime_es(text: str):
